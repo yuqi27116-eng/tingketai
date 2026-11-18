@@ -3503,7 +3503,9 @@ const SDK_URL="https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.4.0/+esm";
 const CLAUDE_MODELS=[["claude-opus-5-5","Claude Opus 5.5（默认）"],["claude-sonnet-5-5","Claude Sonnet 5.5"],["claude-haiku-5-5","Claude Haiku 5.5"],["claude-fable-5-2","Claude Fable 5.2（最强，最贵）"]];
 const FALLBACK_OK=/^claude-(opus-5-5|opus-5|sonnet-5-5|fable-5-2|fable-5-1)$/;
 const STT_PRESETS={openai:["https://api.openai.com/v1","whisper-1"],groq:["https://api.groq.com/openai/v1","whisper-large-v3"]};
-const api={mode:"builtin",key:"",model:"claude-opus-5-5",quickModel:"",sttBase:STT_PRESETS.openai[0],sttKey:"",sttModel:STT_PRESETS.openai[1]};
+// Other model providers that speak the OpenAI-compatible Chat Completions format (base URL + key + model name).
+const OA_PRESETS={deepseek:["DeepSeek","https://api.deepseek.com","deepseek-chat"],qwen:["通义千问","https://dashscope.aliyuncs.com/compatible-mode/v1","qwen-plus"],kimi:["Kimi","https://api.moonshot.cn/v1","moonshot-v1-32k"],custom:["自定义","",""]};
+const api={mode:"builtin",key:"",model:"claude-opus-5-5",quickModel:"",oaBase:OA_PRESETS.deepseek[1],oaKey:"",oaModel:OA_PRESETS.deepseek[2],oaQuick:"",sttBase:STT_PRESETS.openai[0],sttKey:"",sttModel:STT_PRESETS.openai[1]};
 try{ Object.assign(api,JSON.parse(localStorage.getItem("tkt-api")||"{}")); }catch(e){}
 function saveApi(){ try{ localStorage.setItem("tkt-api",JSON.stringify(api)); }catch(e){} }
 let builtinSample=null, sdkMod=null, apiClient=null, apiClientKey="";
@@ -3559,8 +3561,54 @@ function makeApiSample(){
   fn.external=true;
   return fn;
 }
+// ---------- other providers (DeepSeek, Qwen, Kimi, …) via the OpenAI-compatible /chat/completions API ----------
+// Same call shape as `sample`. Streams the answer; JSON answers are parsed leniently (looseJSON). Images are not
+// sent (limits().images=false), so slide screenshots fall back to PDF/PPTX import. A provider that does not allow
+// calls from a web page (CORS) fails with a clear message instead of looking like a dropped connection.
+let oaReached=false;
+function makeOpenAISample(){
+  const call=async(input,opts={})=>{
+    const messages=(typeof input==="string"?[{role:"user",content:input}]:input).map(m=>({role:m.role,content:String(m.content)}));
+    const model=(opts.modelTier==="quick"&&api.oaQuick)||api.oaModel;
+    let r;
+    try{
+      r=await fetch(api.oaBase.replace(/\/+$/,"")+"/chat/completions",{method:"POST",signal:opts.signal,
+        headers:{"Content-Type":"application/json",Authorization:"Bearer "+api.oaKey},
+        body:JSON.stringify({model,messages,stream:true,max_tokens:8000})});
+    }catch(e){
+      if(e&&e.name==="AbortError") throw e;
+      if(!navigator.onLine||oaReached) throw {code:"network",message:"连不上 "+api.oaBase+"（网络）"};
+      throw {code:"blocked",message:"浏览器连不上 "+api.oaBase+"：地址不对，或这个服务不允许网页直接调用（CORS）"};
+    }
+    oaReached=true;
+    if(r.status===401||r.status===403) throw {code:"not_granted",message:"key 无效或没有权限（"+r.status+"）"};
+    if(r.status===429) throw {code:"rate_limited",message:"请求太频繁（429）"};
+    if(!r.ok) throw {code:"api_error",message:`接口返回 ${r.status}：${(await r.text()).slice(0,200)}`};
+    let text="";
+    if((r.headers.get("content-type")||"").includes("text/event-stream")&&r.body){
+      const rd=r.body.getReader(), dec=new TextDecoder(); let buf="";
+      for(;;){
+        const {value,done}=await rd.read(); if(done) break;
+        buf+=dec.decode(value,{stream:true});
+        let i; while((i=buf.indexOf("\n"))>=0){
+          const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
+          if(!line.startsWith("data:")) continue;
+          const d=line.slice(5).trim(); if(d==="[DONE]") continue;
+          try{ const j=JSON.parse(d), delta=j.choices&&j.choices[0]&&j.choices[0].delta; if(delta&&delta.content){ text+=delta.content; if(opts.onText) opts.onText({text,delta:delta.content}); } }catch(e){}
+        }
+      }
+    } else { const j=await r.json(); text=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||""; }
+    return {text};
+  };
+  const fn=(input,opts)=>call(input,opts);
+  fn.json=async(input,opts={})=>looseJSON((await call(input,opts)).text);
+  fn.limits=async()=>({images:false});
+  fn.external=true;
+  return fn;
+}
 function activateProvider(){
   if(api.mode==="api"&&api.key&&!IN_CLAUDE){ sample=makeApiSample(); }
+  else if(api.mode==="openai"&&api.oaKey&&!IN_CLAUDE){ sample=makeOpenAISample(); }
   else sample=builtinSample;
   renderAll();
 }
@@ -3653,7 +3701,8 @@ function renderApi(){
   ${IN_CLAUDE?`<p class="warnbox">你现在在 claude.ai 里：这里的网页连不到外部服务，所以下面的 key 在这里不会生效。把 index.html 下载到电脑用 Chrome 打开，或者部署成网站后，这些设置才能用。</p>`:""}
   <h4>AI（翻译、笔记、思维导图、提问、问 AI）</h4>
   <label class="radio"><input type="radio" name="apimode" value="builtin" ${api.mode!=="api"?"checked":""}> ${IN_CLAUDE?"claude.ai 内置（推荐）":"claude.ai 内置（这里不可用）"}</label>
-  <label class="radio"><input type="radio" name="apimode" value="api" ${api.mode==="api"?"checked":""} ${IN_CLAUDE?"disabled":""}> 用我自己的 Anthropic API key</label>
+  <label class="radio"><input type="radio" name="apimode" value="api" ${api.mode==="api"?"checked":""} ${IN_CLAUDE?"disabled":""}> 用我自己的 Anthropic API key（Claude）</label>
+  <label class="radio"><input type="radio" name="apimode" value="openai" ${api.mode==="openai"?"checked":""} ${IN_CLAUDE?"disabled":""}> 用其他模型：DeepSeek、通义千问、Kimi 等（OpenAI 兼容接口）</label>
   <div class="apigrid">
     <label for="apiKey">API key</label><input type="password" id="apiKey" value="${esc(api.key)}" placeholder="sk-ant-…" autocomplete="off">
     <label for="apiModel">模型</label><select id="apiModel">${opt(0,api.model,CLAUDE_MODELS)}</select>
@@ -3661,6 +3710,16 @@ function renderApi(){
   </div>
   <p class="hint">快速档用于翻译片段这类小请求；不改就用同一个模型、调低思考强度。Claude 拒答时会自动换一个模型重试。</p>
   <div class="row"><button class="btn" type="button" id="apiTest">测试 Anthropic key</button><span class="hint" id="apiTestOut"></span></div>
+  <h4>其他模型（选了上面第三项时使用）</h4>
+  <div class="row"><span class="hint">预设：</span>${Object.entries(OA_PRESETS).map(([k,v])=>`<button class="btn" type="button" data-oa="${k}">${v[0]}</button>`).join("")}</div>
+  <div class="apigrid">
+    <label for="oaBase">接口地址</label><input type="text" id="oaBase" value="${esc(api.oaBase)}" placeholder="https://api.deepseek.com">
+    <label for="oaKey">key</label><input type="password" id="oaKey" value="${esc(api.oaKey)}" placeholder="sk-…" autocomplete="off">
+    <label for="oaModel">模型</label><input type="text" id="oaModel" value="${esc(api.oaModel)}" placeholder="deepseek-chat">
+    <label for="oaQuick">快速档模型</label><input type="text" id="oaQuick" value="${esc(api.oaQuick)}" placeholder="留空 = 同上">
+  </div>
+  <p class="hint">填服务商文档里的 Base URL（到 /v1 这一层，不要带 /chat/completions）和模型名。这类模型不能看图片；有的服务不允许网页直接调用，点「测试」就知道能不能用。</p>
+  <div class="row"><button class="btn" type="button" id="oaTest">测试这个模型</button><span class="hint" id="oaTestOut"></span></div>
   <h4>语音转写（导入录音用）</h4>
   <div class="row"><span class="hint">预设：</span><button class="btn" type="button" data-stt="openai">OpenAI Whisper</button><button class="btn" type="button" data-stt="groq">Groq（快、便宜）</button></div>
   <div class="apigrid">
@@ -3674,12 +3733,17 @@ function renderApi(){
 function readApi(){
   const m=document.querySelector('input[name="apimode"]:checked'); if(m) api.mode=m.value;
   api.key=$("apiKey").value.trim(); api.model=$("apiModel").value; api.quickModel=$("apiQuick").value;
+  api.oaBase=$("oaBase").value.trim().replace(/\/chat\/completions\/?$/,""); api.oaKey=$("oaKey").value.trim(); api.oaModel=$("oaModel").value.trim(); api.oaQuick=$("oaQuick").value.trim();
   api.sttBase=$("sttBase").value.trim()||STT_PRESETS.openai[0]; api.sttKey=$("sttKey").value.trim(); api.sttModel=$("sttModel").value.trim()||"whisper-1";
 }
 $("apiBtn").onclick=()=>{ renderApi(); $("apiModal").hidden=false; };
-$("apiClose").onclick=()=>{ readApi(); saveApi(); $("apiModal").hidden=true; activateProvider(); toast(api.mode==="api"&&api.key&&!IN_CLAUDE?`AI 改用你的 Anthropic key（${api.model}）`:"AI 使用 claude.ai 内置"); };
+$("apiClose").onclick=()=>{ readApi(); saveApi(); $("apiModal").hidden=true; activateProvider();
+  toast(IN_CLAUDE?"AI 使用 claude.ai 内置":api.mode==="api"&&api.key?`AI 改用你的 Anthropic key（${api.model}）`:api.mode==="openai"&&api.oaKey?`AI 改用 ${api.oaModel}（${api.oaBase.replace(/^https?:\/\//,"")}）`:"没有填 key：AI 功能先关着，听写、录音、课件、笔记照常可用"); };
 $("apiModal").addEventListener("click",async e=>{
   const p=e.target.closest("[data-stt]"); if(p){ const [b,m]=STT_PRESETS[p.dataset.stt]; $("sttBase").value=b; $("sttModel").value=m; return; }
+  const o=e.target.closest("[data-oa]"); if(o){ const [,b,m]=OA_PRESETS[o.dataset.oa]; $("oaBase").value=b; $("oaModel").value=m; $("oaQuick").value=""; const r=$("apiModal").querySelector('input[value="openai"]'); if(r&&!r.disabled) r.checked=true; (b?$("oaKey"):$("oaBase")).focus(); return; }
+  if(e.target.id==="oaTest"){ readApi(); const out=$("oaTestOut"); out.textContent="测试中…";
+    try{ const r=await makeOpenAISample()("Reply with the single word OK.",{modelTier:"quick"}); out.textContent="可以用 ✓ 回复："+r.text.trim().slice(0,20); }catch(err){ out.textContent="不行："+(err&&err.message||err&&err.code||err); } }
   if(e.target.id==="apiTest"){ readApi(); const out=$("apiTestOut"); out.textContent="测试中…";
     try{ const r=await makeApiSample()("Reply with the single word OK.",{modelTier:"quick"}); out.textContent="可以用 ✓ 回复："+r.text.trim().slice(0,20); }catch(err){ out.textContent="不行："+(err&&err.message||err&&err.code||err); } }
   if(e.target.id==="sttTest"){ readApi(); const out=$("sttTestOut"); out.textContent="测试中…";
@@ -3809,10 +3873,11 @@ function bindDict(){
 renderLangs(); cur=EXAMPLE; renderAll(); renderNet(); setTimeout(ping,1500);
 (async()=>{
   const cl=window.claude;
-  if(!cl||!cl.use){ dict=webSpeechDict(); bindDict(); loadLocal(); migrateMyNotes(); if(api.mode==="api"&&api.key) sample=makeApiSample(); if(sessions.length) cur=sessions.slice().sort((a,b)=>b.created-a.created)[0]; renderAll(); return; }
+  if(!cl||!cl.use){ dict=webSpeechDict(); bindDict(); loadLocal(); migrateMyNotes(); if(api.mode==="api"&&api.key) sample=makeApiSample(); else if(api.mode==="openai"&&api.oaKey) sample=makeOpenAISample(); if(sessions.length) cur=sessions.slice().sort((a,b)=>b.created-a.created)[0]; renderAll(); return; }
   const [d,smp,dbx,usr,ast]=await Promise.all([cl.use("dictation"),cl.use("sample"),cl.use("db"),cl.use("user"),cl.use("assets")].map(p=>Promise.resolve(p).catch(()=>null)));
   dict=d||webSpeechDict(); builtinSample=smp; sample=smp; assets=ast;
   if(api.mode==="api"&&api.key&&!IN_CLAUDE) sample=makeApiSample();
+  else if(api.mode==="openai"&&api.oaKey&&!IN_CLAUDE) sample=makeOpenAISample();
   bindDict();
   let id=null; try{ id=usr?await usr.id():null; }catch(e){}
   if(dbx&&id){
