@@ -481,7 +481,7 @@ textarea{width:100%;min-height:90px;resize:vertical}
         <button class="btn" id="pauseBtn" hidden>⏸ 暂停</button>
         <button class="btn" id="paraBtn" type="button" hidden title="老师换话题了？点一下，下一句另起一段（只影响显示）">¶ 新段落</button>
         <button class="btn endrec" id="endBtn" type="button" hidden title="结束本场，进入复习模式">■ 结束录制</button>
-        <div class="resume" id="resumeBar" hidden role="alert"><span id="resumeMsg">转录中断了</span><button class="btn primary" id="resumeBtn">继续转录</button></div>
+        <div class="resume" id="resumeBar" hidden role="alert"><span id="resumeMsg">转录中断了</span><button class="btn primary" id="resumeBtn">⟳ 恢复转录</button></div>
         <div class="stxt"><h2 id="sessTitle">开始录音</h2>
         <div class="status" id="status">点击麦克风开始实时转录</div></div>
         <div class="player" id="player" hidden>
@@ -937,7 +937,7 @@ $("liveStrip").onclick=resumeFollow;
 function renderHeader(){
   $("sessTitle").textContent=recording?"正在录音":(cur?(cur.title||"未命名录音"):"开始录音");
   $("micBtn").classList.toggle("rec",recording);
-  $("micBtn").setAttribute("aria-label",recording?"停止录音":"开始录音");
+  if(!recording) $("micBtn").setAttribute("aria-label","开始录音");
   $("endBtn").hidden=!recording;
   if(!recording) $("status").textContent=cur?`${langName(cur.src)} → ${langName(cur.tgt)} · ${cur.lines.length} 句 · ${fmt(cur.durationMs||0)} · ${folderName(cur.folderId)}`:(dict?"点击麦克风开始实时转录":"这个窗口用不了听写：请在 Chrome 或 Claude 桌面应用中打开，或用下方输入框");
   $("copyMd").disabled=!cur; $("refineBtn").disabled=!cur||cur.example||recording||refining||!aiOn(cur); $("delSess").disabled=!cur||cur.example||recording;
@@ -1080,8 +1080,28 @@ function addTick(f){
 }
 function removeTick(f){ ticks.delete(f); if(ticks.size) return; if(tickW){ tickW.postMessage(0); tickW.terminate(); tickW=null; } clearInterval(tickFallback); tickFallback=null; }
 let recTickLast=0;
+function heard(){ lastHeard=Date.now(); if(stalled){ stalled=false; renderRecState(); } }
+// Stuck-transcription watchdog: "listening" but no text for 45 s, or (with local audio) someone is clearly talking
+// and nothing has come for 12 s. Tries one automatic recovery per stall, then offers the single 恢复转录 button.
+function stallCheck(){
+  if(!recording||!listening||!dict||(cur&&cur.demo)||!lastHeard) return;
+  const quiet=Date.now()-lastHeard, talking=Date.now()-(arec.loudAt||0)<3000;
+  if(!stalled&&(quiet>45000||(talking&&quiet>12000))){
+    stalled=true; renderRecState();
+    if(Date.now()-stallTried>60000){ stallTried=Date.now(); recoverAuto(); }
+  }
+}
+function recoverAuto(){ // no click available: stop, then start; if the start needs a click, the 恢复转录 bar stays
+  intentStop=true; ignoreIdleUntil=Date.now()+3000;
+  Promise.resolve().then(()=>dict.stop()).catch(()=>{}).then(()=>{
+    let p; try{ p=dict.start(); }catch(e){ p=Promise.reject(e); }
+    Promise.resolve(p).then(()=>{ listening=true; stalled=false; interrupted=false; intentStop=false; lastHeard=Date.now(); renderRecState(); toast("转录卡住了，已自动重新接上"); },
+      ()=>{ listening=false; interrupted=true; intentStop=false; flushPartial(); closeSegment(); gapStart(); renderRecState(); });
+  });
+}
 function recTick(){
   if(Date.now()-recTickLast<480) return; recTickLast=Date.now();
+  stallCheck();
   if(recording&&!listening&&dict){ renderRecState(); }
   if(recording&&Date.now()%5000<500) sweepUntranslated(cur);
   if(recording&&(listening||!dict)){ cur.durationMs=Date.now()-recStart; $("status").textContent=`● 录音中 ${fmt(cur.durationMs)} · ${cur.lines.length} 句 · ${langName(cur.src)} → ${langName(cur.tgt)}${audioTag()}`; maybeSummarize(cur); checkKeys(cur); checkQuestions(cur); }
@@ -1097,7 +1117,7 @@ async function keepAwake(on){
 function beginRecording(){
   cur=newSession(); sessions.push(cur); recording=true; recStart=cur.startedAt; partialText=""; segDone=0; segRaw=""; uttLines=[]; lastRaw=""; lastPartialAt=Date.now();
   showingFolder=false; $("folderView").hidden=true; $("recordView").style.display="flex";
-  follow=true; const dk=defaultDeck(cur); if(dk){ cur.deckId=dk.id; cur.tpg=0; sv.pg=0; sv.follow=true; sv.focus=null; lay.slides=true; lay.stage="compact"; applyLayout(); }
+  follow=true; lastHeard=Date.now(); stalled=false; const dk=defaultDeck(cur); if(dk){ cur.deckId=dk.id; cur.tpg=0; sv.pg=0; sv.follow=true; sv.focus=null; lay.slides=true; lay.stage="compact"; applyLayout(); }
   addTick(recTick); keepAwake(true);
   renderAll();
 }
@@ -1140,6 +1160,23 @@ function startDictation(){
     return Promise.reject(e);
   });
 }
+// One button fixes a stuck or dropped transcription without leaving the session. A plain start() is not enough
+// when the dictation service still believes it is running (that is why only ending and restarting used to help):
+// so it is stopped first, then started again in the same click, and once more after the stop has finished.
+let ignoreIdleUntil=0, lastHeard=0, stalled=false, stallTried=0;
+function recoverNow(){   // call straight from a click/key handler
+  if(!recording||!dict||(cur&&cur.demo)) return;
+  intentStop=true; ignoreIdleUntil=Date.now()+3000;
+  let stopP; try{ stopP=Promise.resolve(dict.stop()).catch(()=>{}); }catch(e){ stopP=Promise.resolve(); }
+  if(listening){ listening=false; flushPartial(); closeSegment(); }
+  const pushed=openSegment(); $("resumeBar").hidden=true;
+  const ok=()=>{ listening=true; interrupted=false; stalled=false; intentStop=false; lastHeard=Date.now(); renderRecState(); renderTranscript(); gapStop(); audioStart(cur); toast("转录已恢复，接在本场后面"); };
+  startDictation().then(ok,()=>{
+    stopP.then(()=>{ let p; try{ p=dict.start(); }catch(e){ p=Promise.reject(e); }
+      Promise.resolve(p).then(ok,e=>{ undoSegment(pushed); listening=false; interrupted=true; renderRecState();
+        $("resumeMsg").textContent=e&&e.code==="not_granted"?"麦克风权限被拒绝了，可以在浏览器地址栏左边重新允许。":"还没接上：再点一次「恢复转录」。"; }); });
+  });
+}
 function openSegment(){
   const s=cur; if(!s) return;
   s.segments=s.segments||[{start:startOf(s),end:null}];
@@ -1157,14 +1194,21 @@ function flushPartial(){
   if(partialText){ const seg=partialText; partialText=""; segDone=lastRaw.length; segRaw=lastRaw; pushFragment(seg); }
   closeSentence(); segDone=0; segRaw=""; lastRaw=""; draftText=""; draftFor="";
 }
+// Exactly one action for the transcription at any time: 暂停 (running) / 继续 (paused) / 恢复转录 (dropped or stuck),
+// plus 结束. The big mic button does the same action while recording.
+function recMode(){ return !recording?"idle":(interrupted||stalled)?"broken":paused||!listening?"paused":"live"; }
 function renderRecState(){
-  const pb=$("pauseBtn");
-  pb.hidden=!recording||!dict||!!(cur&&cur.demo);
+  const pb=$("pauseBtn"), m=recMode();
+  pb.hidden=!recording||!dict||!!(cur&&cur.demo)||m==="broken";
   $("paraBtn").hidden=!recording||!prefs.manualPara; $("paraBtn").classList.toggle("on",pendingBreak); $("paraBtn").textContent=pendingBreak?"¶ 下一句另起一段":"¶ 新段落";
-  pb.textContent=paused||interrupted?"▶ 继续":"⏸ 暂停";
+  pb.textContent=m==="paused"?"▶ 继续":"⏸ 暂停";
   $("micBtn").classList.toggle("paused",recording&&!listening);
-  $("resumeBar").hidden=!(recording&&interrupted);
-  if(recording&&!listening) $("status").textContent=interrupted?"● 转录已中断，本场仍在：点“继续”接着录":`⏸ 已暂停 ${fmt(Date.now()-recStart)} · ${cur.lines.length} 句 · 点“继续”接着录，点麦克风结束本场`;
+  $("micBtn").setAttribute("aria-label",!recording?"开始录音":m==="broken"?"恢复转录":m==="paused"?"继续":"暂停");
+  $("micBtn").title=recording?"录音中点这里："+($("micBtn").getAttribute("aria-label"))+"；结束请点「■ 结束录制」":"开始录音";
+  $("resumeBar").hidden=!(recording&&m==="broken"&&dict&&!(cur&&cur.demo));
+  if(stalled&&!interrupted) $("resumeMsg").textContent=arec.level>0.02?"有人在说话，但已经十几秒没有文字了，转录可能卡住了。":"转录好像停了（很久没有文字）。";
+  if(recording&&m==="broken") $("status").textContent="● 转录中断了，本场还在：点「⟳ 恢复转录」";
+  else if(recording&&!listening) $("status").textContent=`⏸ 已暂停 ${fmt(Date.now()-recStart)} · ${cur.lines.length} 句 · 点「▶ 继续」接着录`;
 }
 async function pauseRec(){
   if(!recording||!listening) return;
@@ -1218,16 +1262,16 @@ document.addEventListener("visibilitychange",()=>{
 function gestureResume(e){
   if(!recording||listening||!interrupted||!dict||(cur&&cur.demo)) return;
   if(e.target&&e.target.closest&&e.target.closest("#endBtn,#micBtn,#pauseBtn,#resumeBtn")) return;
-  resumeRec();
+  recoverNow();
 }
 document.addEventListener("pointerdown",gestureResume,true);
 document.addEventListener("keydown",gestureResume,true);
 $("endBtn").onclick=()=>{ if(recording) endRecording(); };
-$("pauseBtn").onclick=()=>{ if(listening) pauseRec(); else resumeRec(); };
-$("resumeBtn").onclick=()=>resumeRec();
+$("pauseBtn").onclick=()=>{ const m=recMode(); if(m==="broken") recoverNow(); else if(m==="live") pauseRec(); else resumeRec(); };
+$("resumeBtn").onclick=()=>recoverNow();
 
 $("micBtn").addEventListener("click",()=>{
-  if(recording){ endRecording(); return; }
+  if(recording){ if(!dict||(cur&&cur.demo)){ endRecording(); return; } const m=recMode(); if(m==="broken") recoverNow(); else if(m==="live") pauseRec(); else resumeRec(); return; }
   if(!dict){ beginRecording(); audioStart(cur); $("status").textContent="听写不可用，请用下方输入框逐句加入；点麦克风结束"; $("manualIn").focus(); return; }
   const p=startDictation();
   beginRecording(); renderRecState(); audioStart(cur);
@@ -3141,6 +3185,8 @@ async function audioStart(s){
   if(!recording||cur!==s||arec.mr){ return; }
   const mime=["audio/webm;codecs=opus","audio/webm","audio/mp4","audio/ogg;codecs=opus"].find(m=>MediaRecorder.isTypeSupported(m))||"";
   let mr; try{ mr=new MediaRecorder(arec.stream,mime?{mimeType:mime,audioBitsPerSecond:32000}:{}); }catch(e){ return; }
+  if(!arec.an){ try{ const ac=new AudioContext(), an=ac.createAnalyser(); an.fftSize=1024; ac.createMediaStreamSource(arec.stream).connect(an); arec.an=an; arec.buf=new Float32Array(an.fftSize);
+    addTick(()=>{ if(!arec.an||!arec.stream) return; arec.an.getFloatTimeDomainData(arec.buf); let q=0; for(const v of arec.buf) q+=v*v; arec.level=Math.sqrt(q/arec.buf.length); if(arec.level>0.03) arec.loudAt=Date.now(); }); }catch(e){} }
   s.audio=s.audio||[];
   const part={ref:`idb:aud_${s.id}_${s.audio.length}`,start:Date.now(),dur:0,mime:mr.mimeType||mime};
   s.audio.push(part); Object.assign(arec,{mr,part,s,chunks:[]});
@@ -3161,7 +3207,7 @@ async function audioStop(final){
   clearInterval(arec.saveT);
   if(arec.part){ await audioSave(); arec.part.dur=Date.now()-arec.part.start; saveSessionSoon(arec.s); }
   Object.assign(arec,{mr:null,part:null,chunks:[]});
-  if(final&&arec.stream){ arec.stream.getTracks().forEach(t=>t.stop()); arec.stream=null; }
+  if(final&&arec.stream){ arec.stream.getTracks().forEach(t=>t.stop()); arec.stream=null; arec.an=null; arec.loudAt=0; }
 }
 // ---------- filling the silent stretch (dictation stopped, e.g. the page was in the background) ----------
 // While local audio is being recorded, a second recorder on the same microphone stream captures just the stretch
@@ -3862,10 +3908,11 @@ window.addEventListener("beforeunload",()=>{ if(cur&&!cur.example) saveSessionNo
 
 function bindDict(){
   if(!dict) return;
-  dict.onPartial(({text})=>{ if(!recording||!listening) return; onPartialText(text); renderTranscript(); scheduleDraft(); });
-  dict.onFinal(({text})=>{ if(!recording||!listening) return; onFinalText(text); });
+  dict.onPartial(({text})=>{ if(!recording||!listening) return; heard(); onPartialText(text); renderTranscript(); scheduleDraft(); });
+  dict.onFinal(({text})=>{ if(!recording||!listening) return; heard(); onFinalText(text); });
   dict.onState(({state,reason})=>{
-    if(state==="listening"&&recording){ listening=true; interrupted=false; renderRecState(); return; }
+    if(state==="listening"&&recording){ listening=true; interrupted=false; stalled=false; lastHeard=Date.now(); renderRecState(); return; }
+    if(state==="idle"&&Date.now()<ignoreIdleUntil&&(reason==="stopped"||!reason)) return;
     if(state==="idle"&&recording&&listening&&!intentStop) onDictationDropped(reason);
   });
 }
