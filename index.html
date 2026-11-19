@@ -3916,27 +3916,40 @@ function bindDict(){
     if(state==="idle"&&recording&&listening&&!intentStop) onDictationDropped(reason);
   });
 }
+// Any uncaught error is shown (once per message, at most every 5 s) instead of failing silently, so it can be reported.
+let lastErrAt=0; const seenErr=new Set();
+function showErr(m){ m=String(m||"").slice(0,160); if(!m||seenErr.has(m)||Date.now()-lastErrAt<5000) return; seenErr.add(m); lastErrAt=Date.now(); try{ toast("出错了（截图发给我）："+m); }catch(e){} }
+window.addEventListener("error",e=>{ if(e&&e.message) showErr(e.message); });
+window.addEventListener("unhandledrejection",e=>{ const r=e&&e.reason; if(r&&(r.name==="AbortError"||r.code==="aborted")) return; showErr(r&&(r.message||r.code)||r); });
 // ---------- boot ----------
 renderLangs(); cur=EXAMPLE; renderAll(); renderNet(); setTimeout(ping,1500);
 (async()=>{
   const cl=window.claude;
   if(!cl||!cl.use){ dict=webSpeechDict(); bindDict(); loadLocal(); migrateMyNotes(); if(api.mode==="api"&&api.key) sample=makeApiSample(); else if(api.mode==="openai"&&api.oaKey) sample=makeOpenAISample(); if(sessions.length) cur=sessions.slice().sort((a,b)=>b.created-a.created)[0]; renderAll(); return; }
-  const [d,smp,dbx,usr,ast]=await Promise.all([cl.use("dictation"),cl.use("sample"),cl.use("db"),cl.use("user"),cl.use("assets")].map(p=>Promise.resolve(p).catch(()=>null)));
-  dict=d||webSpeechDict(); builtinSample=smp; sample=smp; assets=ast;
-  if(api.mode==="api"&&api.key&&!IN_CLAUDE) sample=makeApiSample();
-  else if(api.mode==="openai"&&api.oaKey&&!IN_CLAUDE) sample=makeOpenAISample();
-  bindDict();
-  let id=null; try{ id=usr?await usr.id():null; }catch(e){}
+  // Each capability is set up on its own as soon as it arrives: one that is slow or never answers (e.g. a new
+  // permission still waiting) must not block dictation, AI or the saved recordings (v21 waited for all five together).
+  const use=n=>Promise.resolve().then(()=>cl.use(n)).catch(e=>{ console.warn("capability "+n,e); return null; });
+  use("assets").then(a=>{ assets=a||null; });
+  use("dictation").then(d=>{ if(!d){ if(!dict){ dict=webSpeechDict(); if(dict) bindDict(); } renderAll(); return; }
+    if(recording&&listening) return; dict=d; bindDict(); renderAll(); });
+  use("sample").then(smp=>{ builtinSample=smp;
+    if(api.mode==="api"&&api.key&&!IN_CLAUDE) sample=makeApiSample();
+    else if(api.mode==="openai"&&api.oaKey&&!IN_CLAUDE) sample=makeOpenAISample();
+    else sample=smp;
+    renderAll(); });
+  const [dbx,usr]=await Promise.all([use("db"),use("user")]);
+  let id=null; try{ id=usr?await usr.id():null; }catch(e){ console.warn(e); }
   if(dbx&&id){
     db=dbx; col=db.collection("data/users/"+id);
     const t=setTimeout(()=>toast("录音记录暂时读不到，稍后会自动出现"),10000);
     try{
       const snap=await col.get(); clearTimeout(t);
-      for(const doc of snap.docs){ const v=doc.data(); if(!v) continue; if(v.kind==="folder") folders.push({id:v.id,name:v.name,terms:v.terms||"",brief:v.brief||"",docs:v.docs||[],created:v.created,pack:v.pack||""}); else if(v.kind==="session") sessions.push(v); else if(v.kind==="deck") decks.push(v); else if(v.kind==="note") notes.push(v); }
-    }catch(e){ clearTimeout(t); console.warn(e); }
+      for(const doc of snap.docs){ try{ const v=doc.data(); if(!v) continue; if(v.kind==="folder") folders.push({id:v.id,name:v.name,terms:v.terms||"",brief:v.brief||"",docs:v.docs||[],created:v.created,pack:v.pack||""}); else if(v.kind==="session"){ if(!Array.isArray(v.lines)) v.lines=[]; sessions.push(v); } else if(v.kind==="deck") decks.push(v); else if(v.kind==="note") notes.push(v); }catch(e){ console.warn("bad doc",e); } }
+    }catch(e){ clearTimeout(t); console.warn(e); toast("读取录音记录失败："+(e&&e.message||e)); }
   } else loadLocal();
-  if(sessions.length&&cur===EXAMPLE) cur=sessions.slice().sort((a,b)=>b.created-a.created)[0];
-  migrateMyNotes(); renderAll();
+  if(sessions.length&&cur===EXAMPLE&&!recording) cur=sessions.slice().sort((a,b)=>b.created-a.created)[0];
+  try{ migrateMyNotes(); }catch(e){ console.warn(e); }
+  renderAll();
 })();
 </script>
 </body>
